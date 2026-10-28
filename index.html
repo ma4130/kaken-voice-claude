@@ -130,7 +130,11 @@ function drawBG() {
 }
 
 // ===== マイク・音 =====
-let AC = null, analyser = null, tbuf = null, noiseBuf = null, sound = false, micOK = false;
+let AC = null, analyser = null, tbuf = null, noiseBuf = null, sound = false, micOK = false, micStream = null, volOff = false;
+function releaseMic() {
+  try { micStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  micStream = null; analyser = null; volOff = true; dbg('声の大きさ OFF（聞き取りを ゆうせん）');
+}
 function ensureAC() {
   if (!AC) {
     AC = new (window.AudioContext || window.webkitAudioContext)();
@@ -142,7 +146,7 @@ function ensureAC() {
 }
 async function startMic() {
   ensureAC();
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
+  const stream = micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
   const src = AC.createMediaStreamSource(stream);
   analyser = AC.createAnalyser(); analyser.fftSize = 1024;
   src.connect(analyser);
@@ -177,25 +181,38 @@ const SFX = {
 
 // ===== ことば判定（聞きながら どんどん出す） =====
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null, recOn = false, wantRec = false, recSess = 0, recOK = !!SR, recLive = '';
+let rec = null, recOn = false, recLive_ = false, wantRec = false, recSess = 0, recOK = !!SR, recLive = '', recErr = '', recTry = -99, recGot = 0;
 const recMap = new Map(); // key → { text, emitted, at, final }
 function startRec() {
   if (!SR || recOn || !wantRec) return;
+  recTry = T;
   try {
     rec = new SR(); rec.lang = 'ja-JP'; rec.continuous = true; rec.interimResults = true; rec.maxAlternatives = 1;
-    const sess = ++recSess;
+    const sess = ++recSess, me = rec;
+    rec.onstart = () => { recLive_ = true; recErr = ''; dbg('start'); setStatus(); };
     rec.onresult = e => {
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i];
+        recGot++; dbg((r.isFinal ? '確定 ' : '途中 ') + r[0].transcript);
         onRecText(sess + ':' + i, r[0].transcript, r.isFinal);
       }
     };
-    rec.onend = () => { recOn = false; flushAll(true); if (wantRec) setTimeout(startRec, 200); };
+    rec.onend = () => {
+      if (me !== rec) return;
+      recOn = false; recLive_ = false; dbg('end'); flushAll(true);
+      if (wantRec) setTimeout(startRec, 250);
+      setStatus();
+    };
     rec.onerror = e => {
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { wantRec = false; recOK = false; setStatus(); }
+      if (e.error !== 'no-speech' && e.error !== 'aborted') recErr = e.error;
+      dbg('error ' + e.error);
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { wantRec = false; recOK = false; }
+      // スマホなどで マイクの とりあい になったら 声の大きさ を あきらめて 聞き取りを ゆうせん
+      if (e.error === 'audio-capture' && micStream) releaseMic();
+      setStatus();
     };
     rec.start(); recOn = true;
-  } catch (err) { recOn = false; }
+  } catch (err) { recOn = false; recErr = err && err.name || 'start'; dbg('start失敗 ' + (err && err.message)); }
   setStatus();
 }
 const cleanText = t => (t || '').replace(/[。、，．,.!！?？「」『』…・]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -302,7 +319,7 @@ function update(dt) {
   }
   if (pendShout) {
     if (lastWordAt >= pendShout.t0 - 0.3) pendShout = null;
-    else if (!(recOK && recOn) || T - pendShout.at > M.noWordWait) {
+    else if (!SR || !recOK || T - pendShout.at > M.noWordWait) {
       const d = pendShout.dur, n = Math.min(6, Math.floor((d - 0.2) / 0.13) + 1);
       emitWord(d < 0.25 ? 'わっ' : n <= 2 ? 'わ' + 'ー'.repeat(n) : 'うわ' + 'あ'.repeat(n - 1), pendShout.peak);
       pendShout = null;
@@ -423,15 +440,30 @@ function drawMeter() {
 }
 
 // ===== ステータス表示 =====
+const ERRJ = { network: 'ネットにつながらない', 'audio-capture': 'マイクを ほかで つかっている', 'not-allowed': 'マイクが 許可されていない',
+  'service-not-allowed': 'このブラウザでは つかえない', 'language-not-supported': '日本語に たいおうしていない' };
 function setStatus() {
   const el = $('status');
   let txt, on = false, warn = false;
-  if (!micOK) { txt = 'マイク じゅんびちゅう…'; }
-  else if (AC && AC.state !== 'running') { txt = '画面を クリックすると 声の大きさも はんえい'; warn = true; on = recOK && recOn; }
-  else if (!SR || !recOK) { txt = 'ことば判定なし（声の大きさだけ）'; warn = true; }
+  // 聞き取りが 止まっていたら たてなおす
+  if (wantRec && !recOn && T - recTry > 1.5) startRec();
+  if (!micOK && !volOff) { txt = 'マイク じゅんびちゅう…'; }
+  else if (!SR) { txt = 'このブラウザは ことば判定なし（パソコンの Chrome で ひらいてね）'; warn = true; }
+  else if (!recOK) { txt = 'ことば判定が つかえません（' + (ERRJ[recErr] || recErr || '許可なし') + '）'; warn = true; }
+  else if (!recLive_) { txt = 'ことば判定 つなぎなおし中…' + (recErr ? '（' + (ERRJ[recErr] || recErr) + '）' : ''); warn = true; }
+  else if (AC && AC.state !== 'running' && !volOff) { txt = 'きいてるよ ／ 画面を クリックすると 声の大きさも はんえい'; on = true; }
   else { txt = 'きいてるよ'; on = true; }
   $('stText').textContent = txt;
   el.classList.toggle('on', on); el.classList.toggle('warn', warn);
+}
+// ?debug で 聞き取りの ようすを 画面の左下に 出す
+const DEBUG = new URLSearchParams(location.search).has('debug'), dbgLog = [];
+function dbg(s) {
+  if (!DEBUG) return;
+  dbgLog.push((T.toFixed(1) + 's ') + s); if (dbgLog.length > 12) dbgLog.shift();
+  let el = $('dbg');
+  if (!el) { el = document.createElement('pre'); el.id = 'dbg'; el.style.cssText = 'position:fixed;left:44px;bottom:8px;z-index:7;margin:0;font:12px/1.4 monospace;background:rgba(255,255,255,.85);color:#2a0b3d;padding:6px 8px;border-radius:8px;max-width:70vw;white-space:pre-wrap;pointer-events:none'; document.body.appendChild(el); }
+  el.textContent = dbgLog.join('\n') + '\nSR:' + (SR ? 'あり' : 'なし') + ' 聞き取り:' + (recLive_ ? 'ON' : 'OFF') + ' 結果:' + recGot + ' 音:' + (AC ? AC.state : '-') + (volOff ? ' 声量OFF' : '');
 }
 
 // ===== はじめる =====
@@ -442,6 +474,10 @@ async function begin() {
     wantRec = true; startRec();
     $('tap').classList.add('hide');
   } catch (err) {
+    dbg('マイク失敗 ' + (err && err.name));
+    if (SR && err && err.name !== 'NotAllowedError') { // 声の大きさが とれなくても 聞き取りだけで うごかす
+      volOff = true; wantRec = true; startRec(); $('tap').classList.add('hide'); setStatus(); return;
+    }
     $('tap').classList.remove('hide');
     if (err && err.name === 'NotAllowedError') $('tapNote').innerHTML = 'マイクが ブロックされています。<br>アドレスバーの 🔒 から マイクを「許可」してから タップしてね。';
     else if (err) $('tapNote').textContent = 'マイクが つかえませんでした（' + (err.name || 'エラー') + '）。';
@@ -450,8 +486,13 @@ async function begin() {
 }
 $('bTap').onclick = e => { e.stopPropagation(); ensureAC(); begin(); };
 $('tap').onclick = () => { ensureAC(); begin(); };
-addEventListener('pointerdown', () => { if (AC && AC.state === 'suspended') AC.resume().then(setStatus, () => {}); });
-addEventListener('keydown', () => { if (AC && AC.state === 'suspended') AC.resume().then(setStatus, () => {}); });
+// クリック・キーで 音と 聞き取りを 起こしなおす（ブラウザが さわるまで 止めることがあるため）
+function poke() {
+  if (AC && AC.state === 'suspended') AC.resume().then(setStatus, () => {});
+  if (wantRec && !recOn) { recTry = -99; startRec(); }
+}
+addEventListener('pointerdown', poke);
+addEventListener('keydown', poke);
 addEventListener('contextmenu', e => e.preventDefault());
 $('bSnd').onclick = () => { sound = !sound; $('bSnd').textContent = sound ? '🔊' : '🔇'; ensureAC(); };
 $('bFull').onclick = () => {
@@ -495,7 +536,7 @@ if (TEST) {
   const q = new URLSearchParams(location.search), scene = q.get('scene');
   if (scene) setTimeout(() => {
     const k = window.__kd; Math.random = (() => { let x = 7; return () => (x = (x * 16807) % 2147483647) / 2147483647; })();
-    k.pause(); recOn = true; micOK = true;
+    k.pause(); recOn = true; recLive_ = true; micOK = true;
     if (scene === 'words') { k.emit('こんにちは', 0.55); k.tick(0.25); k.emit('すごい', 0.95); k.tick(0.15); k.hear('ことばだま', false); k.tick(0.1); }
     if (scene === 'idle') { k.tick(9); }
     setStatus();
