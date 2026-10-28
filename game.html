@@ -249,7 +249,7 @@ const SFX = {
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null, recOn = false, wantRec = false, recSess = 0, recWorks = !!SR;
 function startRec() {
-  if (!SR || recOn || !wantRec) return;
+  if (!SR || recOn || !wantRec || document.hidden) return; // 聞き取りは Chrome 全体で1つ。見えているタブだけ
   try {
     rec = new SR(); rec.lang = 'ja-JP'; rec.continuous = true; rec.interimResults = true; rec.maxAlternatives = 1;
     const sess = ++recSess;
@@ -858,6 +858,7 @@ $('bTitle').onclick = () => {
 };
 $('mute').onclick = () => { muted = !muted; $('mute').textContent = muted ? '🔇' : '🔊'; };
 
+document.addEventListener('visibilitychange', () => { if (document.hidden) { if (rec && recOn) try { rec.abort(); } catch (e) {} } else if (wantRec && !recOn) startRec(); });
 addEventListener('resize', resize);
 resize();
 if (document.fonts && document.fonts.load) document.fonts.load(`40px "Dela Gothic One"`, 'あ').catch(() => {});
