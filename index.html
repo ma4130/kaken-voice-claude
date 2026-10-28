@@ -255,12 +255,136 @@ function splitWords(s) {
   const out = [];
   for (const g of SEG.segment(s)) {
     const w = g.segment.trim(); if (!w) continue;
-    if (out.length && (!g.isWordLike || /^[ぁ-ゖー]$/.test(w))) out[out.length - 1] += w;
+    const prev = out[out.length - 1];
+    if (prev && (!g.isWordLike || /^[ぁ-ゖー]$/.test(w) || (/^[ぁ-ゖー]{1,2}$/.test(w) && /[一-龯々]$/.test(prev)))) out[out.length - 1] += w; // 「遊」+「ぼう」→「遊ぼう」
     else out.push(w);
   }
   return out;
 }
 const wordQ = []; let wordQT = 0; // 単語の じゅんばんまち（1つずつ すぐ 出す）
+
+// ===== Whisper（パソコンの中で うごく 音声認識。WebGPU で 動かす） =====
+// しゃべりはじめから 声を ためて、0.35秒ぶん ふえるたびに 聞き取りなおし → ふえた 単語を 出す。
+// しずかになったら その まとまりを 確定。読みこみが おわるまでは Chrome の 聞き取りで つなぐ。
+const Q = new URLSearchParams(location.search);
+const W_MODELS = { base: 'onnx-community/whisper-base', tiny: 'onnx-community/whisper-tiny', small: 'onnx-community/whisper-small' };
+const WSP = { model: W_MODELS[Q.get('model')] || W_MODELS.base, step: 0.35, silence: 0.45, maxSeg: 7, pre: 0.3 };
+let ENGINE = Q.get('engine') === 'chrome' ? 'chrome' : 'whisper';
+const wsp = { worker: null, ready: false, loading: false, pct: 0, mb: 0, err: '', busy: false, seg: null, segId: 0, ms: 0 };
+const WORKER_SRC = `
+import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+let asr = null; const files = {};
+const OPT = { language: 'japanese', task: 'transcribe', max_new_tokens: 64 };
+self.onmessage = async (e) => {
+  const m = e.data;
+  if (m.type === 'load') {
+    try {
+      asr = await pipeline('automatic-speech-recognition', m.model, { device: 'webgpu',
+        dtype: { encoder_model: 'fp32', decoder_model_merged: 'fp32' },
+        progress_callback: (p) => {
+          if (p.status !== 'progress' || !p.total) return;
+          files[p.file] = [p.loaded, p.total];
+          let l = 0, t = 0; for (const k in files) { l += files[k][0]; t += files[k][1]; }
+          self.postMessage({ type: 'progress', pct: l / t * 100, mb: t / 1e6 });
+        } });
+      self.postMessage({ type: 'progress', pct: 100, warm: true });
+      await asr(new Float32Array(16000), OPT); // 1回目は おそいので 先に 空まわし
+      self.postMessage({ type: 'ready' });
+    } catch (err) { self.postMessage({ type: 'error', msg: String((err && err.message) || err) }); }
+  } else if (m.type === 'run') {
+    const t0 = performance.now(); let text = '', er = '';
+    try { text = (await asr(m.audio, OPT)).text || ''; } catch (err) { er = String((err && err.message) || err); }
+    self.postMessage({ type: 'text', key: m.key, final: m.final, holdLast: m.holdLast, peak: m.peak, dur: m.dur, text, err: er, ms: performance.now() - t0 });
+  }
+};`;
+async function startWhisper() {
+  if (ENGINE !== 'whisper' || wsp.loading || wsp.ready) return;
+  let gpu = false;
+  try { gpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()); } catch (e) {}
+  if (!gpu) { ENGINE = 'chrome'; wsp.err = 'このパソコンでは WebGPU が つかえない'; dbg('Whisper なし（WebGPU なし）'); setStatus(); return; }
+  wsp.loading = true;
+  try {
+    wsp.worker = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' })), { type: 'module' });
+  } catch (e) { ENGINE = 'chrome'; wsp.err = 'Worker'; setStatus(); return; }
+  wsp.worker.onmessage = e => onWhisper(e.data);
+  wsp.worker.onerror = e => { onWhisper({ type: 'error', msg: e.message || 'worker error' }); };
+  wsp.worker.postMessage({ type: 'load', model: WSP.model });
+  dbg('Whisper 読みこみ開始 ' + WSP.model);
+  setStatus();
+}
+const HALLU = /ご視聴ありがとうございました|チャンネル登録|字幕|最後まで(ご覧|見て)/;
+function onWhisper(m) {
+  if (m.type === 'progress') { wsp.pct = m.pct; if (m.mb) wsp.mb = m.mb; setStatus(); return; }
+  if (m.type === 'error') {
+    wsp.loading = false; wsp.err = m.msg; ENGINE = 'chrome'; dbg('Whisper エラー ' + m.msg);
+    if (!wantRec) { wantRec = true; startRec(); }
+    setStatus(); return;
+  }
+  if (m.type === 'ready') {
+    wsp.loading = false; wsp.ready = true; dbg('Whisper じゅんびOK');
+    wantRec = false; if (rec && recOn) try { rec.abort(); } catch (e) {} // Chrome の 聞き取りは とめる
+    setStatus(); return;
+  }
+  if (m.type === 'text') {
+    wsp.busy = false; wsp.ms = m.ms;
+    let text = m.text.trim();
+    dbg((m.final ? '確定 ' : '途中 ') + Math.round(m.ms) + 'ms ' + text + (m.err ? ' ERR ' + m.err : ''));
+    if (HALLU.test(text)) text = '';
+    if (!m.final && m.holdLast && !/[。！？!?、,.]\s*$/.test(text)) { // しゃべっている さいちゅうは 最後の 単語が とちゅうかも → まだ 出さない
+      const ws = splitWords(cleanText(text).replace(/\s/g, '')); ws.pop(); text = ws.join('');
+    }
+    const st = recMap.get(m.key);
+    if (m.final && !cleanText(text) && !(st && st.emitted) && m.peak >= 0.45) { // 叫びが 文字に ならなかったら「わー！」
+      const n = Math.min(6, Math.floor((m.dur - 0.2) / 0.13) + 1);
+      emitWord(m.dur < 0.25 ? 'わっ' : n <= 2 ? 'わ' + 'ー'.repeat(n) : 'うわ' + 'あ'.repeat(n - 1), m.peak);
+    }
+    if (cleanText(text) || m.final) onRecText(m.key, text, m.final);
+  }
+}
+// 16kHz で 声を ためる（さいごの 30秒ぶん）
+let capAC = null; const capBuf = new Float32Array(16000 * 30); let capN = 0;
+function startCapture() {
+  if (capAC || !micStream) return;
+  try {
+    capAC = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const src = capAC.createMediaStreamSource(micStream);
+    const sp = capAC.createScriptProcessor(1024, 1, 1), mute = capAC.createGain();
+    mute.gain.value = 0;
+    sp.onaudioprocess = e => capPush(e.inputBuffer.getChannelData(0));
+    src.connect(sp); sp.connect(mute); mute.connect(capAC.destination);
+  } catch (e) { dbg('録音 失敗 ' + e.message); }
+}
+function capPush(d) { for (let i = 0; i < d.length; i++) capBuf[(capN + i) % capBuf.length] = d[i]; capN += d.length; }
+function capSlice(from, to) {
+  from = Math.max(from, to - capBuf.length);
+  const out = new Float32Array(Math.max(0, to - from));
+  for (let i = from; i < to; i++) out[i - from] = capBuf[i % capBuf.length];
+  return out;
+}
+function whisperRun(seg, final) {
+  const audio = capSlice(seg.start, capN);
+  seg.lastRunN = capN;
+  wsp.busy = true;
+  wsp.worker.postMessage({ type: 'run', key: 'w' + seg.id, audio, final, holdLast: !final && T - seg.lastVoice < 0.15, peak: seg.peak, dur: seg.voiced }, [audio.buffer]);
+}
+// 毎フレーム：声の まとまりを 見はって 聞き取りに まわす
+function whisperTick(dt, db, lv) {
+  if (!wsp.ready || T < calibUntil) return;
+  const speaking = db > thr || testSpeak;
+  let s = wsp.seg;
+  if (!s && speaking) s = wsp.seg = { id: ++wsp.segId, start: Math.max(0, capN - WSP.pre * 16000), lastVoice: T, lastRunN: 0, peak: lv, voiced: 0, done: false };
+  if (!s) return;
+  if (speaking) { s.lastVoice = T; s.voiced += dt; s.peak = Math.max(s.peak, lv); }
+  const len = (capN - s.start) / 16000;
+  if (!s.done && (T - s.lastVoice > WSP.silence || len > WSP.maxSeg)) s.done = true;
+  if (wsp.busy) return;
+  if (s.done) {
+    wsp.seg = null;
+    if (s.voiced >= 0.12) whisperRun(s, true);
+    else recMap.delete('w' + s.id);
+  } else if (s.voiced >= 0.12 && capN - s.lastRunN >= WSP.step * 16000) whisperRun(s, false);
+}
+let testSpeak = false;
 function flushAll(force) {
   for (const [k, st] of recMap) if (force || T - st.at >= M.stable) { flush(st); if (force) recMap.delete(k); }
 }
@@ -329,6 +453,7 @@ function update(dt) {
   if (T < calibUntil) noiseDb += (db - noiseDb) * Math.min(1, dt * 5);
   else if (!shout && db < noiseDb + 8) noiseDb += (db - noiseDb) * Math.min(1, dt * 1.5);
   thr = clamp(noiseDb + 10, -52, -24);
+  whisperTick(dt, db, lv);
 
   // 大きい声（ことばに ならない「わー！」も ひろう）
   if (T > calibUntil && analyser) {
@@ -345,7 +470,7 @@ function update(dt) {
     }
   }
   if (pendShout) {
-    if (lastWordAt >= pendShout.t0 - 0.3) pendShout = null;
+    if (lastWordAt >= pendShout.t0 - 0.3 || wsp.ready) pendShout = null; // Whisper の ときは 確定のときに 判断
     else if (!SR || !recOK || T - pendShout.at > M.noWordWait) {
       const d = pendShout.dur, n = Math.min(6, Math.floor((d - 0.2) / 0.13) + 1);
       emitWord(d < 0.25 ? 'わっ' : n <= 2 ? 'わ' + 'ー'.repeat(n) : 'うわ' + 'あ'.repeat(n - 1), pendShout.peak);
@@ -477,6 +602,16 @@ function setStatus() {
   // 聞き取りが 止まっていたら たてなおす
   if (wantRec && !recOn && nowS() - recTry > Math.max(1.5, recBack + 0.5)) startRec();
   if (!micOK && !volOff) { txt = 'マイク じゅんびちゅう…'; }
+  else if (wsp.ready) {
+    const sus = (capAC && capAC.state !== 'running') || (AC && AC.state !== 'running');
+    if (sus) { txt = '画面を クリックすると はじまります'; warn = true; }
+    else { txt = 'きいてるよ（Whisper）'; on = true; }
+  }
+  else if (wsp.loading) {
+    txt = 'Whisper じゅんびちゅう ' + (wsp.pct >= 100 ? 'もうすこし…' : Math.floor(wsp.pct) + '%' + (wsp.mb ? '（はじめてだけ 約' + Math.round(wsp.mb) + 'MB）' : ''))
+      + (recLive_ ? ' ／ いまは Chrome で 聞き取り中' : '');
+    on = recLive_; warn = !recLive_;
+  }
   else if (!SR) { txt = 'このブラウザは ことば判定なし（パソコンの Chrome で ひらいてね）'; warn = true; }
   else if (!recOK) { txt = 'ことば判定が つかえません（' + (ERRJ[recErr] || recErr || '許可なし') + '）'; warn = true; }
   else if (!recLive_) { txt = 'ことば判定 つなぎなおし中…' + (recErr ? '（' + (ERRJ[recErr] || recErr) + '）' : ''); warn = true; }
@@ -492,7 +627,7 @@ function dbg(s) {
   dbgLog.push((T.toFixed(1) + 's ') + s); if (dbgLog.length > 12) dbgLog.shift();
   let el = $('dbg');
   if (!el) { el = document.createElement('pre'); el.id = 'dbg'; el.style.cssText = 'position:fixed;left:44px;bottom:8px;z-index:7;margin:0;font:12px/1.4 monospace;background:rgba(255,255,255,.85);color:#2a0b3d;padding:6px 8px;border-radius:8px;max-width:70vw;white-space:pre-wrap;pointer-events:none'; document.body.appendChild(el); }
-  el.textContent = dbgLog.join('\n') + '\nSR:' + (SR ? 'あり' : 'なし') + ' 聞き取り:' + (recLive_ ? 'ON' : 'OFF') + ' 結果:' + recGot + ' 音:' + (AC ? AC.state : '-') + (volOff ? ' 声量OFF' : '');
+  el.textContent = dbgLog.join('\n') + '\nSR:' + (SR ? 'あり' : 'なし') + ' 聞き取り:' + (recLive_ ? 'ON' : 'OFF') + ' 結果:' + recGot + ' 音:' + (AC ? AC.state : '-') + (volOff ? ' 声量OFF' : '') + ' Whisper:' + (wsp.ready ? 'OK ' + Math.round(wsp.ms) + 'ms' : wsp.loading ? Math.floor(wsp.pct) + '%' : (wsp.err || '-'));
 }
 
 // ===== はじめる =====
@@ -500,7 +635,8 @@ async function begin() {
   try {
     await startMic();
     calibUntil = T + 1;
-    wantRec = true; startRec();
+    if (ENGINE === 'whisper') { startCapture(); startWhisper(); }
+    wantRec = true; startRec(); // Whisper の じゅんびが できるまでは Chrome の 聞き取りで つなぐ
     $('tap').classList.add('hide');
   } catch (err) {
     dbg('マイク失敗 ' + (err && err.name));
@@ -518,6 +654,7 @@ $('tap').onclick = () => { ensureAC(); begin(); };
 // クリック・キーで 音と 聞き取りを 起こしなおす（ブラウザが さわるまで 止めることがあるため）
 function poke() {
   if (AC && AC.state === 'suspended') AC.resume().then(setStatus, () => {});
+  if (capAC && capAC.state === 'suspended') capAC.resume().then(setStatus, () => {});
   if (wantRec && !recOn) { recBack = 0.25; startRec(); }
 }
 addEventListener('pointerdown', poke);
@@ -563,6 +700,28 @@ if (TEST) {
     tick(sec = 1) { const n = Math.round(sec * 60); for (let i = 0; i < n; i++) update(1 / 60); draw(); },
     state() { return { bullets: bullets.map(b => b.text + '@' + b.z.toFixed(1)), live: recLive, pending: [...recMap.values()].map(s => s.text + '|' + s.emitted) }; },
     reload() { location.reload(); },
+    // Whisper の テスト：音声ファイルを マイクの かわりに じっさいの 速さで ながしこむ
+    async whisper(url = '_test_ja.wav') {
+      const b = await (await fetch(url)).arrayBuffer(), dv = new DataView(b); let off = 12, pcm = null;
+      while (off < dv.byteLength) { const id = String.fromCharCode(...new Uint8Array(b, off, 4)), sz = dv.getUint32(off + 4, true); if (id === 'data') { pcm = new Int16Array(b, off + 8, sz / 2); break; } off += 8 + sz; }
+      const audio = Float32Array.from(pcm, v => v / 32768);
+      testPause = true; ENGINE = 'whisper'; micOK = true; calibUntil = 0;
+      await startWhisper();
+      while (!wsp.ready && !wsp.err) { await new Promise(r => setTimeout(r, 200)); update(0.2); }
+      if (wsp.err) return 'ERR ' + wsp.err;
+      const log = [], t0 = performance.now(), orig = emitWord;
+      emitWord = (w, lv) => { log.push(((performance.now() - t0) / 1000).toFixed(2) + 's ' + w); orig(w, lv); };
+      const step = 800; // 50ms
+      for (let i = 0; i < audio.length + 16000 * 1.5; i += step) {
+        const chunk = i < audio.length ? audio.subarray(i, i + step) : new Float32Array(step);
+        testSpeak = i < audio.length; capPush(chunk); update(0.05); draw();
+        await new Promise(r => setTimeout(r, 50));
+      }
+      for (let k = 0; k < 40 && (wsp.busy || wsp.seg); k++) { update(0.05); await new Promise(r => setTimeout(r, 50)); }
+      for (let k = 0; k < 20; k++) update(0.05);
+      emitWord = orig;
+      return { audioSec: (audio.length / 16000).toFixed(2), words: log, lastMs: Math.round(wsp.ms) };
+    },
     pause(on = true) { testPause = on; },
   };
   const q = new URLSearchParams(location.search), scene = q.get('scene');
