@@ -62,6 +62,7 @@ const FONT = '"Dela Gothic One","Hiragino Kaku Gothic StdN","Hiragino Sans","Mei
 const M = {
   stable: 0,       // 聞き取りの途中結果が この秒数かわらなければ 先に出す（0 = 届いたら すぐ）
   maxChars: 10,    // 1つの弾に のせる 最大の文字数
+  wordGap: 0.08,   // 単語を つづけて 出すときの 間（秒）
   noWordWait: 0.7, // 大声のあと この秒数 ことばが出なければ「わー！」を出す
   sens: 50,        // 感度（大きいほど 小さい声でも 大きく出る）
   powerAt: [0.3, 0.5, 0.68, 0.85], // 声の大きさ(0〜1)→パワー2,3,4,5の境目
@@ -242,10 +243,24 @@ function flush(st) {
   if (!add.replace(/\s/g, '')) return;
   st.emitted += add.replace(/\s/g, '').length;
   for (const w of add.split(' ')) {
-    const s = w.replace(/\s/g, '');
-    for (let i = 0; i < s.length; i += M.maxChars) emitWord(s.slice(i, i + M.maxChars));
+    for (const s of splitWords(w.replace(/\s/g, '')))
+      for (let i = 0; i < s.length; i += M.maxChars) wordQ.push(s.slice(i, i + M.maxChars));
   }
 }
+// 文を 単語に 切る（ブラウザの 単語わけ 機能。「は」「が」など 1文字の ひらがなは 前に くっつける）
+const SEG = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter('ja', { granularity: 'word' }) : null;
+function splitWords(s) {
+  if (!s) return [];
+  if (!SEG) return [s];
+  const out = [];
+  for (const g of SEG.segment(s)) {
+    const w = g.segment.trim(); if (!w) continue;
+    if (out.length && (!g.isWordLike || /^[ぁ-ゖー]$/.test(w))) out[out.length - 1] += w;
+    else out.push(w);
+  }
+  return out;
+}
+const wordQ = []; let wordQT = 0; // 単語の じゅんばんまち（1つずつ すぐ 出す）
 function flushAll(force) {
   for (const [k, st] of recMap) if (force || T - st.at >= M.stable) { flush(st); if (force) recMap.delete(k); }
 }
@@ -274,10 +289,11 @@ function emitWord(word, lv) {
   const power = powerOf(lv);
   const text = decorate(word, power);
   const f = 0.45 + lv * 1.0;
-  const n = bullets.filter(b => b.t < 0.6).length; // いっぺんに出たら ずらす
+  // 前の ことばは 奥へ おしだす（いちばん新しい ことばが 手前で 大きく 読めるように）
+  for (const o of bullets) if (o.z < 7) { o.z += 2.6; o.t = Math.max(o.t, 0.2); o.vx += (o.x >= 0 ? 1 : -1) * rand(0.6, 1.2); }
   const b = {
     text, wr: measureRatio(text), f, power, t: 0,
-    x: n ? rand(-1.6, 1.6) : rand(-0.4, 0.4), y: 1.0 + n * 0.35, z: 2.2,
+    x: rand(-0.3, 0.3), y: 1.0, z: 2.2,
     vx: rand(-0.6, 0.6), endZ: rand(24, 32), rot: rand(-0.08, 0.08), alive: true,
   };
   bullets.push(b);
@@ -337,6 +353,8 @@ function update(dt) {
     }
   }
   flushAll(false);
+  wordQT -= dt;
+  if (wordQ.length && wordQT <= 0) { emitWord(wordQ.shift()); wordQT = M.wordGap; }
   // いま 聞き取り中の ことば（まだ 出していない ぶん）
   recLive = '';
   for (const st of recMap.values()) { const r = restOf(st.text, st.emitted).replace(/\s/g, ''); if (r) recLive = r; }
@@ -344,7 +362,7 @@ function update(dt) {
   gridOff += dt * 3;
   for (const b of bullets) {
     b.t += dt;
-    const v = b.t < 0.3 ? 1 : Math.min(45, 4 + (b.t - 0.3) * 45);
+    const v = b.t < 0.15 ? 2 : Math.min(45, 6 + (b.t - 0.15) * 50);
     b.z += v * dt; b.x += b.vx * dt; b.y += (2.4 - b.y) * Math.min(1, dt * 0.8);
     if (b.z >= b.endZ) burst(b);
   }
@@ -392,7 +410,7 @@ function text3D(text, x, y, px, col, o = {}) {
 // ===== 描画 =====
 function drawBullet(b) {
   const p = proj(b.x, b.y, b.z);
-  const pop = b.t < 0.18 ? 0.6 + b.t / 0.18 * 0.55 : b.t < 0.3 ? 1.15 - (b.t - 0.18) / 0.12 * 0.15 : 1; // ドーンと出る
+  const pop = b.t < 0.1 ? 0.7 + b.t / 0.1 * 0.45 : b.t < 0.2 ? 1.15 - (b.t - 0.1) / 0.1 * 0.15 : 1; // ドーンと出る
   const px = Math.min(b.f * p.s, W * 0.95 / b.wr, H * 0.5) * pop;
   const a = clamp((b.endZ - b.z) / 4, 0, 1);
   text3D(b.text, p.x, p.y, px, PCOL[b.power], { rot: b.rot + Math.sin(b.t * 18) * 0.03, alpha: a, wr: b.wr, depth: px * 0.22 });
@@ -553,6 +571,7 @@ if (TEST) {
     k.pause(); recOn = true; recLive_ = true; micOK = true;
     if (scene === 'words') { k.emit('こんにちは', 0.55); k.tick(0.25); k.emit('すごい', 0.95); k.tick(0.15); k.hear('ことばだま', false); k.tick(0.1); }
     if (scene === 'idle') { k.tick(9); }
+    if (scene === 'many') { k.hear('きょうはいいてんきだねありがとう', true); k.tick(+(q.get('t') || 0.35)); }
     setStatus();
   }, 600);
 }
